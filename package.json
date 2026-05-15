@@ -1,0 +1,28 @@
+{
+  "name": "indo-scraper",
+  "version": "3.0.0",
+  "description": "Scraper Indonesia — berita, BMKG, saham, emas, kurs, BBM, cek nomor, cek resi",
+  "main": "index.js",
+  "keywords": [
+    "scraper",
+    "indonesia",
+    "berita",
+    "bmkg",
+    "saham",
+    "kurs",
+    "kompas",
+    "detik"
+  ],
+  "author": "Angga Putra",
+  "url": "git+https://github.com/Putra-Dev/indo-scraper.git", 
+  "license": "MIT",
+  "dependencies": {
+    "assert": "^2.1.0",
+    "axios": "^1.7.2",
+    "cheerio": "^1.0.0",
+    "cloudscraper": "^4.6.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

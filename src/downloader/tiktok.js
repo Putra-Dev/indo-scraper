@@ -8,7 +8,7 @@ const SNAPTIK_HEADERS = {
   'Accept-Language': 'id-ID,id;q=0.9',
 }
 
-// Resolve short URL → dapatkan URL penuh + video ID
+// Resolve short URL → dapatkan URL penuh + ID + tipe (video/photo)
 async function resolveUrl(url) {
   try {
     const res = await axios.get(url, {
@@ -17,11 +17,11 @@ async function resolveUrl(url) {
       timeout: 15000,
     })
     const finalUrl = res.request?.res?.responseUrl || res.config?.url || url
-    const match = finalUrl.match(/video\/(\d+)/)
-    return { url: finalUrl, id: match?.[1] || null }
+    const match = finalUrl.match(/\/(video|photo)\/(\d+)/)
+    return { url: finalUrl, id: match?.[2] || null, isPhoto: match?.[1] === 'photo' }
   } catch (e) {
-    const match = url.match(/video\/(\d+)/)
-    return { url, id: match?.[1] || null }
+    const match = url.match(/\/(video|photo)\/(\d+)/)
+    return { url, id: match?.[2] || null, isPhoto: match?.[1] === 'photo' }
   }
 }
 
@@ -111,23 +111,33 @@ function decodeSnaptik(rawData) {
 
 /*
  * Ambil metadata TikTok (title, author, stats) dari oEmbed + embed page
- * @param {string} videoUrl - URL TikTok video
+ * @param {string} videoUrl - URL TikTok (video atau photo/slide)
  * @param {string} videoId  - ID video (opsional, untuk scrape stats)
  */
 async function getTiktokMeta(videoUrl, videoId = null) {
   let title = '', author = '', authorUrl = '', thumbnail = ''
   let likes = null, views = null, shares = null, comments = null
 
+  const fetchOembed = (u) => axios.get(
+    `https://www.tiktok.com/oembed?url=${encodeURIComponent(u)}`,
+    { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 10000 }
+  )
+
   // 1. oEmbed — dapat title, author, thumbnail
+  // Endpoint oEmbed TikTok kadang menolak URL /photo/, jadi kalau gagal
+  // dicoba lagi pakai varian /video/ (ID-nya tetap sama).
   try {
-    const oe = await axios.get(
-      `https://www.tiktok.com/oembed?url=${encodeURIComponent(videoUrl)}`,
-      { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 10000 }
-    )
-    title      = oe.data.title || ''
-    author     = oe.data.author_name || ''
-    authorUrl  = oe.data.author_url || ''
-    thumbnail  = oe.data.thumbnail_url || ''
+    let data
+    try {
+      data = (await fetchOembed(videoUrl)).data
+    } catch (_) {
+      if (!videoUrl.includes('/photo/')) throw _
+      data = (await fetchOembed(videoUrl.replace('/photo/', '/video/'))).data
+    }
+    title      = data.title || ''
+    author     = data.author_name || ''
+    authorUrl  = data.author_url || ''
+    thumbnail  = data.thumbnail_url || ''
   } catch (_) {}
 
   // 2. Embed page — dapat stats (likes, views, shares, comments)
@@ -184,152 +194,284 @@ async function getTiktokMeta(videoUrl, videoId = null) {
   return { title, author, authorUrl, thumbnail, likes, views, comments, shares }
 }
 
-// ── TikTok Video Downloader ────────────────────────────────────────────────
+// ── TikTok Downloader (video + slide, auto-detect) ─────────────────────────
+
+// Domain situs downloader lain yang kadang nyempil sebagai iklan/cross-promo
+// di halaman hasil scraping — bukan link media asli, jadi harus diabaikan.
+const NON_MEDIA_DOMAINS = ['snaptik.app', 'ssstik.io', 'musicaldown.com', 'pindown.io', 'savetik', 'ttsave', 'snapcdn.app', 'tikmate', 'downtik', 'sssnaptik']
+
+function isNonMediaLink(href) {
+  try { return NON_MEDIA_DOMAINS.some(d => new URL(href).hostname.toLowerCase().includes(d)) }
+  catch (_) { return true } // href tidak valid → aman diabaikan
+}
+
+// Provider 1: snaptik — kuat untuk video (ada HD + audio asli)
+async function fetchViaSnaptik(fullUrl) {
+  try {
+    const rawData = await snaptikFetch(fullUrl)
+    const decoded = decodeSnaptik(rawData)
+    if (!decoded) return null
+
+    const $ = cheerio.load(decoded)
+    if ($('.error, .alert-danger').first().text().trim()) return null
+
+    let video = null, video_hd = null, music = null
+    $('a[href]').each((_, el) => {
+      let href = $(el).attr('href') || ''
+      if (href.startsWith('//')) href = 'https:' + href
+      if (!href.startsWith('http') || isNonMediaLink(href)) return
+
+      const cls = $(el).attr('class') || ''
+      const dl  = $(el).attr('download')
+      const isMp4Ext = /\.mp4(\?|$)/i.test(href)
+      const isMp3Ext = /\.(mp3|m4a)(\?|$)/i.test(href)
+
+      // Hanya anggap link download valid kalau ada atribut download ATAU ekstensi file eksplisit —
+      // teks anchor ("download video" dsb) gampang salah tangkap link promosi/iklan.
+      if (dl === undefined && !isMp4Ext && !isMp3Ext) return
+
+      const txt   = $(el).text().toLowerCase().trim()
+      const dlAttr = (dl || '').toLowerCase()
+      const isHD  = txt.includes('hd') || cls.includes('hd') || dlAttr.includes('hd')
+
+      if (isMp3Ext && !music) music = href
+      else if (isHD && !video_hd) video_hd = href
+      else if (!video) video = href
+    })
+
+    return { slides: [], video, video_hd, music }
+  } catch (e) { console.log('[fetchViaSnaptik]', e.message); return null }
+}
+
+// Provider 2: ssstik — bisa deteksi slide (foto) sekaligus video
+async function fetchViaSsstik(url) {
+  try {
+    const H = {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36',
+      'Accept-Language': 'id-ID,id;q=0.9',
+    }
+
+    const pageRes = await axios.get('https://ssstik.io/id', { headers: H, timeout: 15000 })
+    const $page  = cheerio.load(pageRes.data)
+    const tt     = $page('input[name="tt"]').val() || ''
+
+    const formRes = await axios.post(
+      'https://ssstik.io/abc?url=dl',
+      new URLSearchParams({ id: url, locale: 'id', tt }).toString(),
+      {
+        headers: {
+          ...H,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Referer': 'https://ssstik.io/id',
+          'Origin': 'https://ssstik.io',
+          'HX-Request': 'true',
+          'HX-Target': 'target',
+        },
+        timeout: 30000,
+      }
+    )
+
+    const $r = cheerio.load(formRes.data)
+    if ($r('.error, .alert, [class*="error"]').first().text().trim()) return null
+
+    const slides = [], videos = []
+    let music = null
+    $r('a[href]').each((_, el) => {
+      const href = $r(el).attr('href') || ''
+      if (!href.startsWith('http') || isNonMediaLink(href)) return
+      const txt  = $r(el).text().toLowerCase().trim()
+
+      const isMusic = txt.includes('mp3') || txt.includes('musik') || txt.includes('music') || txt.includes('audio') || href.includes('/ssstik/m/')
+      const isVideo = /\.mp4/i.test(href) || txt.includes('video') || txt.includes('mp4')
+      const isSlide = href.includes('/ssstik/') && !isMusic && !isVideo
+
+      if (isMusic && !music) music = href
+      else if (isSlide && !slides.includes(href)) slides.push(href)
+      else if (isVideo && !videos.includes(href)) videos.push(href)
+    })
+
+    return { slides, video: videos[0] || null, video_hd: videos[1] || null, music }
+  } catch (e) { console.log('[fetchViaSsstik]', e.message); return null }
+}
+
+// Provider 3: musicaldown.com — fallback tambahan (video + slide)
+async function fetchViaMusicaldown(url) {
+  try {
+    const H = {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36',
+      'Accept-Language': 'id-ID,id;q=0.9',
+    }
+
+    // Step 1: ambil halaman utama → cookie session + nama field form
+    // (nama field-nya acak per-load, mis. "_ZuT"/"_pCOSh", jadi harus dibaca dari HTML, bukan hardcode)
+    const pageRes = await axios.get('https://musicaldown.com/id', { headers: H, timeout: 15000 })
+    const cookies = (pageRes.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ')
+    const $page   = cheerio.load(pageRes.data)
+    const $form   = $page('form').first()
+
+    const body = { verify: '1' }
+    let linkField = null
+    $form.find('input').each((_, el) => {
+      const name = $page(el).attr('name')
+      const type = ($page(el).attr('type') || 'text').toLowerCase()
+      if (!name) return
+      if (type === 'hidden') body[name] = $page(el).attr('value') || ''
+      else if (!linkField) linkField = name // input teks/url pertama = kolom link
+    })
+    if (!linkField) linkField = '_ZuT' // fallback kalau parsing form gagal
+    body[linkField] = url
+
+    // Step 2: submit URL
+    const formRes = await axios.post(
+      'https://musicaldown.com/id/download',
+      new URLSearchParams(body).toString(),
+      {
+        headers: {
+          ...H,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Referer': 'https://musicaldown.com/id',
+          'Origin': 'https://musicaldown.com',
+          Cookie: cookies,
+        },
+        timeout: 30000,
+      }
+    )
+
+    const $ = cheerio.load(formRes.data)
+    if ($('.alert, .error, [class*="error"]').first().text().trim()) return null
+
+    const slides = [], videos = []
+    let music = null
+
+    // Tombol download video/HD/MP3 asli musicaldown selalu punya class "download" + data-event unik
+    // (mp4_download_click, hd_download_click, watermark_download_click, mp3_download_click).
+    // Link nav biasa (mis. "Download Video Lain" balik ke /id) tidak punya keduanya.
+    $('a.download[href]').each((_, el) => {
+      const href = $(el).attr('href') || ''
+      if (!href.startsWith('http') || isNonMediaLink(href)) return
+
+      const event = ($(el).attr('data-event') || '').toLowerCase()
+      const txt   = $(el).text().toLowerCase().trim()
+
+      const isMp3       = event.includes('mp3') || txt.includes('mp3')
+      const isHD        = event.includes('hd') || txt.includes('[hd]')
+      const isWatermark = event.includes('watermark')
+
+      if (isMp3 && !music) music = href
+      else if (isHD && !videos[1]) videos[1] = href
+      else if (!isWatermark && !videos[0]) videos[0] = href // "Download MP4" polos = versi utama non-watermark
+    })
+
+    // Post slide/foto: tombol "Convert Video Now" (<button>, bukan <a>) menyimpan payload
+    // JSON ter-base64 (author, images[], music, id) di dalam body fetch — ini sumber paling
+    // bersih buat dapetin seluruh array foto, ketimbang scraping tiap <div class="card"> satu-satu.
+    const sliderMatch = formRes.data.match(/data:\s*"(eyJ[A-Za-z0-9+/=]+)"/)
+    if (sliderMatch) {
+      try {
+        const payload = JSON.parse(Buffer.from(sliderMatch[1], 'base64').toString('utf8'))
+        if (Array.isArray(payload.images))
+          payload.images.forEach(img => { if (img && !slides.includes(img)) slides.push(img) })
+        if (payload.music && !music) music = payload.music
+      } catch (_) {}
+    }
+
+    // Fallback kalau format inline script berubah: scrape tombol "Download" di tiap kartu foto
+    if (!slides.length) {
+      $('.card-action a[href]').each((_, el) => {
+        const href = $(el).attr('href') || ''
+        if (href.startsWith('http') && !isNonMediaLink(href) && !slides.includes(href)) slides.push(href)
+      })
+    }
+
+    return { slides, video: videos[0] || null, video_hd: videos[1] || null, music }
+  } catch (e) { console.log('[fetchViaMusicaldown]', e.message); return null }
+}
+
+
+// Susun metadata dasar yang dipakai semua fungsi downloader
+async function buildMetaFields(fullUrl, videoId) {
+  const meta = await getTiktokMeta(fullUrl, videoId)
+  return {
+    id:        videoId,
+    title:     meta.title,
+    author:    meta.author,
+    authorUrl: meta.authorUrl,
+    thumbnail: meta.thumbnail,
+    stats: {
+      likes:    meta.likes,
+      views:    meta.views,
+      comments: meta.comments,
+      shares:   meta.shares,
+    },
+  }
+}
+
+// Cek apakah hasil provider ({ slides, video, video_hd, music }) punya isi
+const hasDlResult = (r) => r && (r.slides.length || r.video || r.video_hd || r.music)
+
+// Gabungkan metadata + hasil provider jadi satu response ok()
+const buildDlResult = (metaFields, r) => ok({
+  ...metaFields,
+  type:         r.slides.length ? 'photo' : 'video',
+  slides:       r.slides,
+  slides_count: r.slides.length,
+  video:        r.video,
+  video_hd:     r.video_hd,
+  music:        r.music,
+})
 
 /*
- * Download video TikTok dari snaptik + metadata dari TikTok embed
- * @param {string} url - URL TikTok video
+ * Download TikTok — auto-detect video atau slide/foto dari satu URL.
+ * Urutan provider: snaptik (video) → ssstik (slide + fallback)
+ * @param {string} url - URL TikTok (video/photo, boleh short link)
  */
-const tiktokDL = async (url) => {
+const tiktok = async (url) => {
   return new Promise(async (resolve) => {
     try {
       if (!url || !url.includes('tiktok.com'))
         return resolve(fail('URL TikTok tidak valid'))
 
-      // Resolve URL pendek → dapat video ID
-      const { url: fullUrl, id: videoId } = await resolveUrl(url)
+      const { url: fullUrl, id: videoId, isPhoto } = await resolveUrl(url)
+      const metaFields = await buildMetaFields(fullUrl, videoId)
 
-      // Fetch snaptik
-      const rawData = await snaptikFetch(fullUrl)
-      const decoded = decodeSnaptik(rawData)
-      if (!decoded) return resolve(fail('Gagal decode respons snaptik'))
+      // Rute cepat: URL sudah teridentifikasi sebagai foto/slide
+      if (isPhoto) {
+        const s = await fetchViaSsstik(url)
+        if (hasDlResult(s)) return resolve(buildDlResult(metaFields, s))
+        return resolve(fail('Tidak ditemukan link download — URL tidak valid atau private'))
+      }
 
-      // Parse download links
-      const $ = cheerio.load(decoded)
-      let video = null, video_hd = null, music = null
+      // Rute utama: coba sebagai video via snaptik
+      const v = await fetchViaSnaptik(fullUrl)
+      if (hasDlResult(v)) return resolve(buildDlResult(metaFields, v))
 
-      const errEl = $('.error, .alert-danger').first().text().trim()
-      if (errEl) return resolve(fail(errEl))
+      // Fallback: mungkin sebenarnya slide/foto — cek ulang via ssstik
+      const s = await fetchViaSsstik(url)
+      if (hasDlResult(s)) return resolve(buildDlResult(metaFields, s))
 
-      $('a[href]').each((_, el) => {
-        let href = $(el).attr('href') || ''
-        if (href.startsWith('//')) href = 'https:' + href
-        if (!href.startsWith('http')) return
-
-        const txt = $(el).text().toLowerCase().trim()
-        const cls = $(el).attr('class') || ''
-        const dl  = $(el).attr('download') || ''
-
-        const isHD    = txt.includes('hd') || cls.includes('hd') || dl.includes('hd')
-        const isVideo = /\.mp4(\?|$)/i.test(href) || txt.includes('video') || dl.includes('mp4')
-        const isMusic = /\.(mp3|m4a)(\?|$)/i.test(href) || txt.includes('music') || txt.includes('audio') || dl.includes('mp3')
-
-        if (isMusic && !music) music = href
-        else if (isHD && !video_hd) video_hd = href
-        else if (isVideo && !video) video = href
-      })
-
-      // Ambil metadata TikTok
-      const meta = await getTiktokMeta(fullUrl, videoId)
-
-      if (!video && !video_hd) return resolve(fail('Tidak ditemukan link download — URL tidak valid atau private'))
-
-      resolve(ok({
-        id:        videoId,
-        title:     meta.title,
-        author:    meta.author,
-        authorUrl: meta.authorUrl,
-        thumbnail: meta.thumbnail,
-        stats: {
-          likes:    meta.likes,
-          views:    meta.views,
-          comments: meta.comments,
-          shares:   meta.shares,
-        },
-        video,
-        video_hd,
-        music,
-      }))
-
-    } catch (e) { console.log('[tiktokVideo]', e.message); resolve(fail(e)) }
+      resolve(fail('Tidak ditemukan link download — URL tidak valid atau private'))
+    } catch (e) { console.log('[tiktok]', e.message); resolve(fail(e)) }
   })
 }
 
-// ── TikTok Slide Downloader ────────────────────────────────────────────────
-
 /*
- * Download TikTok slide — gambar + audio via ssstik.io
- * @param {string} url - URL TikTok video/slide
+ * Download TikTok via musicaldown.com — provider terpisah dari tiktok, auto-detect video/foto.
+ * @param {string} url - URL TikTok (video/photo, boleh short link)
  */
-const tiktokSlide = async (url) => {
+const musically = async (url) => {
   return new Promise(async (resolve) => {
     try {
       if (!url || !url.includes('tiktok.com'))
         return resolve(fail('URL TikTok tidak valid'))
 
-      const H = {
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36',
-        'Accept-Language': 'id-ID,id;q=0.9',
-      }
+      const { url: fullUrl, id: videoId } = await resolveUrl(url)
+      const metaFields = await buildMetaFields(fullUrl, videoId)
 
-      // Step 1: Ambil tt token dari halaman ssstik
-      const pageRes = await axios.get('https://ssstik.io/id', { headers: H, timeout: 15000 })
-      const $page  = cheerio.load(pageRes.data)
-      const tt     = $page('input[name="tt"]').val() || ''
+      const m = await fetchViaMusicaldown(url)
+      if (hasDlResult(m)) return resolve(buildDlResult(metaFields, m))
 
-      // Step 2: Submit URL ke ssstik
-      const formRes = await axios.post(
-        'https://ssstik.io/abc?url=dl',
-        new URLSearchParams({ id: url, locale: 'id', tt }).toString(),
-        {
-          headers: {
-            ...H,
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Referer': 'https://ssstik.io/id',
-            'Origin': 'https://ssstik.io',
-            'HX-Request': 'true',
-            'HX-Target': 'target',
-          },
-          timeout: 30000,
-        }
-      )
-
-      const $r = cheerio.load(formRes.data)
-      const slides = [], videos = []
-      let music = null
-
-      // Cek error
-      const err = $r('.error, .alert, [class*="error"]').first().text().trim()
-      if (err && err.length < 200) return resolve(fail(err))
-
-      $r('a[href]').each((_, el) => {
-        const href = $r(el).attr('href') || ''
-        const txt  = $r(el).text().toLowerCase().trim()
-        const cls  = $r(el).attr('class') || ''
-        if (!href.startsWith('http')) return
-
-        const isMusic = txt.includes('mp3') || txt.includes('musik') || txt.includes('music') || txt.includes('audio') || href.includes('/ssstik/m/')
-        const isVideo = /\.mp4/i.test(href) || txt.includes('video') || txt.includes('mp4')
-        const isSlide = href.includes('/ssstik/') && !isMusic && !isVideo
-
-        if (isMusic && !music) music = href
-        else if (isSlide && !slides.includes(href)) slides.push(href)
-        else if (isVideo && !videos.includes(href)) videos.push(href)
-      })
-
-      if (!videos.length && !slides.length && !music)
-        return resolve(fail('Tidak ditemukan link download — URL tidak valid atau private'))
-
-      resolve(ok({
-        type:         slides.length > 0 ? 'slide' : 'video',
-        video:        videos[0] || null,
-        video_hd:     videos[1] || null,
-        slides,
-        slides_count: slides.length,
-        music,
-      }))
-
-    } catch (e) { console.log('[tiktokSlide]', e.message); resolve(fail(e)) }
+      resolve(fail('Tidak ditemukan link download — URL tidak valid atau private'))
+    } catch (e) { console.log('[musically]', e.message); resolve(fail(e)) }
   })
 }
 
@@ -469,4 +611,4 @@ const renderToVideo = async ({ image_urls, audio_url, filename }) => {
   }
 }
 
-module.exports = { tiktokDL, tiktokSlide, getRenderVideo, renderToVideo }
+module.exports = { tiktok, musically, getRenderVideo, renderToVideo }

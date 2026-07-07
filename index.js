@@ -26,6 +26,7 @@ module.exports = class Scraper {
       // ── Downloader ────────────────────────────────────────────────────────
       require('./src/downloader/instagram'),
       require('./src/downloader/tiktok'),
+      require('./src/downloader/musically'),
       require('./src/downloader/mediafire'),
       require('./src/downloader/facebook'),
       require('./src/downloader/spotify'),

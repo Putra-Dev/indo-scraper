@@ -294,100 +294,6 @@ async function fetchViaSsstik(url) {
   } catch (e) { console.log('[fetchViaSsstik]', e.message); return null }
 }
 
-// Provider 3: musicaldown.com — fallback tambahan (video + slide)
-async function fetchViaMusicaldown(url) {
-  try {
-    const H = {
-      'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36',
-      'Accept-Language': 'id-ID,id;q=0.9',
-    }
-
-    // Step 1: ambil halaman utama → cookie session + nama field form
-    // (nama field-nya acak per-load, mis. "_ZuT"/"_pCOSh", jadi harus dibaca dari HTML, bukan hardcode)
-    const pageRes = await axios.get('https://musicaldown.com/id', { headers: H, timeout: 15000 })
-    const cookies = (pageRes.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ')
-    const $page   = cheerio.load(pageRes.data)
-    const $form   = $page('form').first()
-
-    const body = { verify: '1' }
-    let linkField = null
-    $form.find('input').each((_, el) => {
-      const name = $page(el).attr('name')
-      const type = ($page(el).attr('type') || 'text').toLowerCase()
-      if (!name) return
-      if (type === 'hidden') body[name] = $page(el).attr('value') || ''
-      else if (!linkField) linkField = name // input teks/url pertama = kolom link
-    })
-    if (!linkField) linkField = '_ZuT' // fallback kalau parsing form gagal
-    body[linkField] = url
-
-    // Step 2: submit URL
-    const formRes = await axios.post(
-      'https://musicaldown.com/id/download',
-      new URLSearchParams(body).toString(),
-      {
-        headers: {
-          ...H,
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Referer': 'https://musicaldown.com/id',
-          'Origin': 'https://musicaldown.com',
-          Cookie: cookies,
-        },
-        timeout: 30000,
-      }
-    )
-
-    const $ = cheerio.load(formRes.data)
-    if ($('.alert, .error, [class*="error"]').first().text().trim()) return null
-
-    const slides = [], videos = []
-    let music = null
-
-    // Tombol download video/HD/MP3 asli musicaldown selalu punya class "download" + data-event unik
-    // (mp4_download_click, hd_download_click, watermark_download_click, mp3_download_click).
-    // Link nav biasa (mis. "Download Video Lain" balik ke /id) tidak punya keduanya.
-    $('a.download[href]').each((_, el) => {
-      const href = $(el).attr('href') || ''
-      if (!href.startsWith('http') || isNonMediaLink(href)) return
-
-      const event = ($(el).attr('data-event') || '').toLowerCase()
-      const txt   = $(el).text().toLowerCase().trim()
-
-      const isMp3       = event.includes('mp3') || txt.includes('mp3')
-      const isHD        = event.includes('hd') || txt.includes('[hd]')
-      const isWatermark = event.includes('watermark')
-
-      if (isMp3 && !music) music = href
-      else if (isHD && !videos[1]) videos[1] = href
-      else if (!isWatermark && !videos[0]) videos[0] = href // "Download MP4" polos = versi utama non-watermark
-    })
-
-    // Post slide/foto: tombol "Convert Video Now" (<button>, bukan <a>) menyimpan payload
-    // JSON ter-base64 (author, images[], music, id) di dalam body fetch — ini sumber paling
-    // bersih buat dapetin seluruh array foto, ketimbang scraping tiap <div class="card"> satu-satu.
-    const sliderMatch = formRes.data.match(/data:\s*"(eyJ[A-Za-z0-9+/=]+)"/)
-    if (sliderMatch) {
-      try {
-        const payload = JSON.parse(Buffer.from(sliderMatch[1], 'base64').toString('utf8'))
-        if (Array.isArray(payload.images))
-          payload.images.forEach(img => { if (img && !slides.includes(img)) slides.push(img) })
-        if (payload.music && !music) music = payload.music
-      } catch (_) {}
-    }
-
-    // Fallback kalau format inline script berubah: scrape tombol "Download" di tiap kartu foto
-    if (!slides.length) {
-      $('.card-action a[href]').each((_, el) => {
-        const href = $(el).attr('href') || ''
-        if (href.startsWith('http') && !isNonMediaLink(href) && !slides.includes(href)) slides.push(href)
-      })
-    }
-
-    return { slides, video: videos[0] || null, video_hd: videos[1] || null, music }
-  } catch (e) { console.log('[fetchViaMusicaldown]', e.message); return null }
-}
-
-
 // Susun metadata dasar yang dipakai semua fungsi downloader
 async function buildMetaFields(fullUrl, videoId) {
   const meta = await getTiktokMeta(fullUrl, videoId)
@@ -451,27 +357,6 @@ const tiktok = async (url) => {
 
       resolve(fail('Tidak ditemukan link download — URL tidak valid atau private'))
     } catch (e) { console.log('[tiktok]', e.message); resolve(fail(e)) }
-  })
-}
-
-/*
- * Download TikTok via musicaldown.com — provider terpisah dari tiktok, auto-detect video/foto.
- * @param {string} url - URL TikTok (video/photo, boleh short link)
- */
-const musically = async (url) => {
-  return new Promise(async (resolve) => {
-    try {
-      if (!url || !url.includes('tiktok.com'))
-        return resolve(fail('URL TikTok tidak valid'))
-
-      const { url: fullUrl, id: videoId } = await resolveUrl(url)
-      const metaFields = await buildMetaFields(fullUrl, videoId)
-
-      const m = await fetchViaMusicaldown(url)
-      if (hasDlResult(m)) return resolve(buildDlResult(metaFields, m))
-
-      resolve(fail('Tidak ditemukan link download — URL tidak valid atau private'))
-    } catch (e) { console.log('[musically]', e.message); resolve(fail(e)) }
   })
 }
 
@@ -611,4 +496,4 @@ const renderToVideo = async ({ image_urls, audio_url, filename }) => {
   }
 }
 
-module.exports = { tiktok, musically, getRenderVideo, renderToVideo }
+module.exports = { tiktok, getRenderVideo, renderToVideo }
